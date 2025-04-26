@@ -3,27 +3,229 @@ import asyncio
 from tcp import Servidor
 import re
 
+# Variáveis auxiliares
+mensagemBuffer = b''  # Buffer para armazenar mensagens recebidas, necessário para lidar com chegada de mensagens quebradas
+listaConexoes = []
+listaCanais = [] 
 
-def validar_nome(nome):
+# Funções auxiliares
+def validarNome(nome):
+    # Valida se um nome (apelido) é adequado conforme regra definida
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
-
 def sair(conexao):
-    print(conexao, 'conexão fechada')
-    conexao.fechar()
+    # Trata a saída de um usuário da conexão
+    global mensagemBuffer
+    canaisParticipados = []
+    conexoesOutrosUsuarios = []
 
+    for canal in listaCanais:
+        if conexao in canal[1]:
+            canaisParticipados.append(canal[0])
+            for usuario in canal[1]:
+                if usuario != conexao:
+                    conexoesOutrosUsuarios.append(usuario)
+    conexoesOutrosUsuarios = list(set(conexoesOutrosUsuarios))  # Remove duplicatas
+    nick = obterNick(conexao)
+    for usuario in listaConexoes:
+        if usuario[1] == conexao:
+            listaConexoes.remove(usuario)  # Remove usuário da lista de conexões
+    conexao.fechar()  # Fecha a conexão
+    for destinatario in conexoesOutrosUsuarios:
+        if conexaoEmUso(destinatario):
+            destinatario.enviar(b':' + nick + b' QUIT :Connection closed\r\n')  # Notifica outros usuários
+        mensagemBuffer = b''  # Limpa o buffer
+    
+    for canal in canaisParticipados:
+        removerConexaoDoCanal(canal, conexao)  # Remove a conexão do canal
+        
+def apelidoEmUso(apelido):
+    # Verifica se um apelido já está em uso por outro usuário
+    for usuario in listaConexoes:
+        if usuario[0] == apelido or usuario[0].lower() == apelido.lower():
+            return True
+    return False
 
-def dados_recebidos(conexao, dados):
-    if dados == b'':
+def obterListaDoCanal(nomeCanal):
+    # Retorna a lista de um canal específico, caso exista
+    for canal in listaCanais:
+        if nomeCanal == canal[0] or nomeCanal.lower() == canal[0].lower():
+            return canal
+    return None
+
+def adicionarConexaoAoCanal(canalNome, conexao):
+    # Adiciona uma nova conexão à lista de um canal
+    for canal in listaCanais:
+        if canalNome == canal[0]:
+            canal[1].append(conexao)
+
+def removerConexaoDoCanal(canalNome, conexao):
+    # Remove uma conexão da lista de um canal
+    for canal in listaCanais:
+        if canalNome == canal[0]:
+            try:
+                canal[1].remove(conexao)
+            except ValueError:
+                pass  # Conexão não encontrada na lista
+
+def conexaoEmUso(conexao):
+    # Verifica se uma conexão está associada a um usuário
+    for usuario in listaConexoes:
+        if usuario[1] == conexao:
+            return True
+    return False
+
+def obterNick(conexao):
+    # Obtém o apelido (nick) associado a uma conexão
+    for usuario in listaConexoes:
+        if usuario[1] == conexao:
+            return usuario[0]
+
+def obterConexaoPorNick(nick):
+    # Retorna a conexão associada a um apelido (nick)
+    for usuario in listaConexoes:
+        if usuario[0] == nick or usuario[0].lower() == nick.lower():
+            return usuario[1]
+
+def trocarNick(conexao, novoNick):
+    # Troca o apelido de um usuário associado a uma conexão
+    for usuario in listaConexoes:
+        if usuario[1] == conexao:
+            usuario[0] = novoNick
+            return
+
+def obterUsuariosNoCanal(nomeCanal):
+    # Retorna uma lista de usuários conectados a um canal específico
+    usuarios = []
+    for canal in listaCanais:
+        if canal[0] == nomeCanal:
+            for conexao in canal[1]:
+                usuarios.append(obterNick(conexao))
+            break
+    return sorted(usuarios)
+
+def dadosRecebidos(conexao, dados):
+    # Trata os dados recebidos de uma conexão
+    if dados == b'':  # Se dados vazios, sai da conexão
         return sair(conexao)
-    print(conexao, dados)
+
+    vazio = 0
+    global mensagemBuffer
+
+    while vazio != 1:
+        quebras = dados.count(b'\n')  # Conta o número de quebras de linha
+        if quebras == 0:
+            mensagemBuffer += dados  # Adiciona dados ao buffer
+            vazio = 1
+        elif quebras == 1 and dados.endswith(b'\n'):
+            mensagemBuffer += dados
+            vazio = 1
+        else:
+            dividido = dados.split(b'\n', 1)  # Divide os dados na primeira quebra
+            if b'\n' in dados:
+                mensagemBuffer += dividido[0] + b'\n'  # Adiciona a parte completa ao buffer
+            dados = dividido[1]  # Mantém a parte restante para a próxima iteração
+
+        # Responde a ping do servidor
+        if mensagemBuffer.startswith(b'PING') and mensagemBuffer.endswith(b'\n'):
+            conexao.enviar(b':server PONG server :' + mensagemBuffer.split(b' ', 1)[1])
+            mensagemBuffer = b''
+
+        # Trata comando NICK
+        if mensagemBuffer.startswith(b'NICK') and mensagemBuffer.endswith(b'\n'):
+            nickInserido = mensagemBuffer.split(b' ', 1)[1]
+            nickTratado = nickInserido.split(b'\r', 1)[0]
+
+            if validarNome(nickTratado):
+                if not apelidoEmUso(nickTratado):
+                    if not conexaoEmUso(conexao):
+                        conexao.enviar(b':server 001 ' + nickTratado + b' :Welcome\r\n')  # Boas-vindas ao usuário
+                        conexao.enviar(b':server 422 ' + nickTratado + b' :MOTD File is missing\r\n')  # Mensagem de MOTD
+                        listaConexoes.append([nickTratado, conexao])  # Adiciona conexão à lista
+                        mensagemBuffer = b''
+                    else:
+                        nickAntigo = obterNick(conexao)
+                        trocarNick(conexao, nickTratado)  # Troca o nick do usuário
+                        conexao.enviar(b':' + nickAntigo + b' NICK ' + nickTratado + b'\r\n')  # Notifica mudança de nick
+                else:
+                    # Responde se o nick já está em uso
+                    if conexaoEmUso(conexao):
+                        conexao.enviar(b':server 433 ' + obterNick(conexao) + b' ' + nickTratado + b' :Nickname is already in use\r\n')
+                        mensagemBuffer = b''
+                    else:
+                        conexao.enviar(b':server 433 * ' + nickTratado + b' :Nickname is already in use\r\n')
+                        mensagemBuffer = b''
+            else:
+                conexao.enviar(b':server 432 * ' + nickTratado + b' :Erroneous nickname\r\n')  # Nick inválido
+                mensagemBuffer = b''
+
+        # Trata comando PRIVMSG
+        if mensagemBuffer.startswith(b'PRIVMSG') and mensagemBuffer.endswith(b'\n'):
+            enviado = mensagemBuffer.split(b' ')
+            destinatario = enviado[1]
+            conteudo = enviado[2]
+
+            if destinatario.startswith(b'#'):  # Se destinatário é um canal
+                canalLista = obterListaDoCanal(destinatario)
+                if len(canalLista[1]) > 1:  # Para canais com mais de um usuário
+                    for destinatarioUsuario in canalLista[1]:
+                        if obterNick(destinatarioUsuario) != obterNick(conexao):
+                            destinatarioUsuario.enviar(b':' + obterNick(conexao) + b' PRIVMSG ' + destinatario + b' ' + conteudo)
+                            mensagemBuffer = b''  # Limpa o buffer após envio
+            else:
+                if apelidoEmUso(destinatario):  # Se destinatário é um usuário
+                    obterConexaoPorNick(destinatario).enviar(b':' + obterNick(conexao) + b' PRIVMSG ' + destinatario + b' ' + conteudo)
+                    mensagemBuffer = b''  # Limpa o buffer
+                else:
+                    mensagemBuffer = b''  # Limpa o buffer se destinatário não existe
+
+        # Trata comando JOIN
+        if mensagemBuffer.startswith(b'JOIN') and mensagemBuffer.endswith(b'\n'):
+            nomeCanal = mensagemBuffer.split(b' ')[1]
+            nomeCanal = nomeCanal.replace(b'\r\n', b'')  # Remove caracteres de nova linha
+            listaCanais.append([nomeCanal, []])  # Adiciona novo canal
+            adicionarConexaoAoCanal(nomeCanal, conexao)  # Adiciona conexão ao canal
+            listaConexoesCanal = obterListaDoCanal(nomeCanal)[1]
+
+            # Notifica usuários no canal sobre novo membro
+            for usuario in listaConexoesCanal:
+                usuario.enviar(b':%s JOIN :%s\r\n' % (obterNick(conexao), nomeCanal))
+            
+            usuarios = obterUsuariosNoCanal(nomeCanal)  # Obtém lista de usuários no canal
+            i = 0
+            while i < len(usuarios):
+                msg = b':server 353 %s = %s :' % (obterNick(conexao), nomeCanal)
+                while len(msg) + len(usuarios) + 2 <= 512 and i < len(usuarios):
+                    msg += usuarios[i]  # Adiciona usuários à mensagem
+                    if i < len(usuarios) - 1:
+                        msg += b' '  # Adiciona espaço entre os usuários
+                    else:
+                        msg += b'\r\n'
+                    i += 1
+                conexao.enviar(msg)  # Envia a lista de usuários
+            msg = b':server 366 %s %s :End of /NAMES list.\r\n' % (obterNick(conexao), nomeCanal)  # Mensagem de fim da lista
+            conexao.enviar(msg)
+            mensagemBuffer = b''  # Limpa o buffer
+
+        # Trata comando PART
+        if mensagemBuffer.startswith(b'PART') and mensagemBuffer.endswith(b'\n'):
+            nomeCanal = mensagemBuffer.split(b' ')[1]
+            nomeCanal = nomeCanal.replace(b'\r\n', b'')  # Remove caracteres de nova linha
+            canalLista = obterListaDoCanal(nomeCanal)  # Obtém a lista do canal
+            if canalLista is not None:
+                for destinatario in canalLista[1]:  # Notifica usuários sobre a saída
+                    destinatario.enviar(b':%s PART %s\r\n' % (obterNick(conexao), nomeCanal))
+                    mensagemBuffer = b''  # Limpa o buffer
+            removerConexaoDoCanal(nomeCanal, conexao)  # Remove a conexão do canal
+            mensagemBuffer = b''  # Limpa o buffer
 
 
-def conexao_aceita(conexao):
-    print(conexao, 'nova conexão')
-    conexao.registrar_recebedor(dados_recebidos)
+# Função chamada quando uma nova conexão é aceita
+def conexaoAceita(conexao):
+    # Registra a função que trata dados recebidos de uma nova conexão
+    conexao.registrar_recebedor(dadosRecebidos)
 
-
+# Inicializa o servidor na porta 6667
 servidor = Servidor(6667)
-servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
-asyncio.get_event_loop().run_forever()
+servidor.registrar_monitor_de_conexoes_aceitas(conexaoAceita)  # Registra monitor de conexões
+asyncio.get_event_loop().run_forever()  # Mantém o loop de eventos ativo
